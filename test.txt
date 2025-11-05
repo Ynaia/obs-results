@@ -1,0 +1,71 @@
+
+
+$url = "http://localhost:8080/"
+$listener = New-Object System.Net.HttpListener
+$listener.Prefixes.Add($url)
+$listener.Start()
+ 
+$baseDir = $PSScriptRoot
+if (!$baseDir) { $baseDir = Get-Location }
+ 
+Write-Host "HTTP 服务器已启动，监听地址: $url"
+Write-Host "文件根目录: $baseDir"
+Write-Host "按 Ctrl+C 停止服务器"
+ 
+try {
+    while ($listener.IsListening) {
+        $context = $listener.GetContext()
+        $request = $context.Request
+        $response = $context.Response
+        $localPath = $request.Url.LocalPath
+        $filePath = Join-Path $baseDir $localPath.TrimStart('/')
+        Write-Host "$(Get-Date) - 请求: $localPath 来自: $($request.RemoteEndPoint)"
+        try {
+            if (Test-Path $filePath -PathType Leaf) {
+                # 如果是文件，提供下载
+                $fileBytes = [System.IO.File]::ReadAllBytes($filePath)
+                $response.ContentLength64 = $fileBytes.Length
+                $response.ContentType = "application/octet-stream"
+                $response.AddHeader("Content-Disposition", "attachment; filename=`"$(Split-Path $filePath -Leaf)`"")
+                $response.OutputStream.Write($fileBytes, 0, $fileBytes.Length)
+                Write-Host "  文件已提供下载: $(Split-Path $filePath -Leaf)"
+            }
+            else {
+                # 显示文件列表或 404 页面
+                if (Test-Path $filePath -PathType Container) {
+                    # 如果是目录，显示文件列表
+                    $files = Get-ChildItem $filePath | Where-Object { $_.Name -notlike ".*" }
+                    $html = "<html><body><h1>文件列表: $localPath</h1><ul>"
+                    foreach ($file in $files) {
+                        $html += "<li><a href='$localPath/$($file.Name)'>$($file.Name)</a> ($([math]::Round($file.Length/1KB,2)) KB)</li>"
+                    }
+                    $html += "</ul></body></html>"
+                    $buffer = [System.Text.Encoding]::UTF8.GetBytes($html)
+                    $response.ContentType = "text/html"
+                    $response.ContentLength64 = $buffer.Length
+                    $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                }
+                else {
+                    # 404 页面
+                    $response.StatusCode = 404
+                    $buffer = [System.Text.Encoding]::UTF8.GetBytes("文件未找到: $localPath")
+                    $response.ContentLength64 = $buffer.Length
+                    $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                }
+            }
+        }
+        catch {
+            $response.StatusCode = 500
+            $buffer = [System.Text.Encoding]::UTF8.GetBytes("服务器错误: $($_.Exception.Message)")
+            $response.ContentLength64 = $buffer.Length
+            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+        }
+        finally {
+            $response.Close()
+        }
+    }
+}
+finally {
+    $listener.Stop()
+    Write-Host "服务器已停止"
+}
